@@ -1,0 +1,87 @@
+name: ClickUp sync (central)
+
+on:
+  workflow_call:
+    secrets:
+      CLICKUP_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  create-review-task:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Créer la tâche de review dans ClickUp
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          LIST_ID: ${{ vars.CLICKUP_REVIEW_LIST_ID }}
+          USERS: ${{ vars.CLICKUP_USERS }}
+          REVIEWER: ${{ github.event.requested_reviewer.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REVIEWER}" ]; then
+            echo "Review demandée à une équipe GitHub, pas à une personne : rien à faire."
+            exit 0
+          fi
+          ASSIGNEE=$(echo "$USERS" | jq -r --arg u "$REVIEWER" '.[$u] // empty')
+          if [ -z "$ASSIGNEE" ]; then
+            echo "Pas d'ID ClickUp pour $REVIEWER dans CLICKUP_USERS : tâche créée sans assigné."
+          fi
+          DUE=$(( ($(date +%s) + 2*24*3600) * 1000 ))   # échéance : J+2
+          BODY=$(jq -n \
+            --arg name "Review PR #$PR_NUMBER · $REPO · $PR_TITLE" \
+            --arg desc "$(printf 'Review demandée à **%s** par %s.\n\nPR : %s' "$REVIEWER" "$PR_AUTHOR" "$PR_URL")" \
+            --arg tag "$(echo "pr-$(basename "$REPO")-$PR_NUMBER-$REVIEWER" | tr "[:upper:]" "[:lower:]")" \
+            --argjson due "$DUE" \
+            --arg assignee "$ASSIGNEE" \
+            '{name:$name, markdown_content:$desc, due_date:$due, tags:["review",$tag], priority:2}
+             + (if $assignee != "" then {assignees:[($assignee|tonumber)]} else {} end)')
+          curl -sS --fail -X POST "https://api.clickup.com/api/v2/list/$LIST_ID/task" \
+            -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
+            -d "$BODY" | jq '{id, url}'
+
+  close-on-approval:
+    # Seulement quand la review est une validation (Approve).
+    # "Request changes" ou un simple commentaire ne ferme rien.
+    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Passer la tâche de review et la tâche liée en "complete"
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          LIST_ID: ${{ vars.CLICKUP_REVIEW_LIST_ID }}
+          REVIEWER: ${{ github.event.review.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          complete() {
+            curl -sS --fail -X PUT "https://api.clickup.com/api/v2/task/$1" \
+              -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
+              -d '{"status":"complete"}' > /dev/null && echo "Tâche $1 passée en complete"
+          }
+
+          # 1) La tâche de review du reviewer
+          TAG=$(echo "pr-$(basename "$REPO")-$PR_NUMBER-$REVIEWER" | tr "[:upper:]" "[:lower:]")
+          IDS=$(curl -sS --fail "https://api.clickup.com/api/v2/list/$LIST_ID/task?tags%5B%5D=$TAG" \
+            -H "Authorization: $CLICKUP_TOKEN" | jq -r '.tasks[].id')
+          for id in $IDS; do complete "$id"; done
+
+          # 2) La tâche de dev liée : ID "CU-xxxx" dans la branche, le titre ou la description de la PR
+          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "$PR_TITLE" "${PR_BODY:-}" \
+            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
+          if [ -z "$TASK_IDS" ]; then
+            echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description : rien d'autre à fermer."
+          fi
+          for id in $TASK_IDS; do complete "$id" || echo "Impossible de fermer $id (ID inconnu ?)"; done
