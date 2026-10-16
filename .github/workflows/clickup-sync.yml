@@ -48,13 +48,86 @@ jobs:
             -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
             -d "$BODY" | jq '{id, url}'
 
-  close-on-approval:
-    # Seulement quand la review est une validation (Approve).
-    # "Request changes" ou un simple commentaire ne ferme rien.
-    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
+  # PR créée (ou rouverte) -> la tâche ClickUp liée passe en "in progress".
+  # Si des reviewers sont déjà demandés à la création, on laisse faire le job
+  # "pr-on-hold" (sinon les deux jobs se disputeraient le statut).
+  pr-opened:
+    if: github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened')
     runs-on: ubuntu-latest
     steps:
+      - name: Passer la tâche liée en "in progress"
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REVIEWERS: ${{ join(github.event.pull_request.requested_reviewers.*.login, ',') }}
+          TEAMS: ${{ join(github.event.pull_request.requested_teams.*.slug, ',') }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REVIEWERS$TEAMS" ]; then
+            echo "Des reviewers sont déjà demandés : le statut sera géré par le job on-hold."
+            exit 0
+          fi
+          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "$PR_TITLE" "${PR_BODY:-}" \
+            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
+          if [ -z "$TASK_IDS" ]; then
+            echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description : rien à faire."
+          fi
+          for id in $TASK_IDS; do
+            curl -sS --fail -X PUT "https://api.clickup.com/api/v2/task/$id" \
+              -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
+              -d '{"status":"in progress"}' > /dev/null \
+              && echo "Tâche $id passée en in progress" \
+              || echo "Impossible de modifier $id (ID inconnu ?)"
+          done
+
+  # Review demandée à quelqu'un -> la tâche ClickUp liée passe en "on hold"
+  # (elle attend la review). La tâche de review, elle, est créée par le job create-review-task.
+  pr-on-hold:
+    if: github.event_name == 'pull_request' && github.event.action == 'review_requested'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Passer la tâche liée en "on hold"
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "$PR_TITLE" "${PR_BODY:-}" \
+            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
+          if [ -z "$TASK_IDS" ]; then
+            echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description : rien à faire."
+          fi
+          for id in $TASK_IDS; do
+            curl -sS --fail -X PUT "https://api.clickup.com/api/v2/task/$id" \
+              -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
+              -d '{"status":"on hold"}' > /dev/null \
+              && echo "Tâche $id passée en on hold" \
+              || echo "Impossible de modifier $id (ID inconnu ?)"
+          done
+
+  close-on-approval:
+    # Le job tourne à chaque review soumise (pour que les logs soient visibles),
+    # mais ne ferme quelque chose que si c'est une validation (Approve).
+    # "Request changes" ou un simple commentaire ne ferme rien.
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Afficher l'état de la review
+        env:
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          echo "Review de $REVIEWER : état = $REVIEW_STATE"
+          if [ "${REVIEW_STATE,,}" != "approved" ]; then
+            echo "Ce n'est pas une validation (Approve) : aucune tâche ClickUp n'est fermée."
+          fi
+
       - name: Passer la tâche de review et la tâche liée en "complete"
+        if: github.event.review.state == 'approved'
         env:
           CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
           LIST_ID: ${{ vars.CLICKUP_REVIEW_LIST_ID }}
