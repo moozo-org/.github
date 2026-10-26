@@ -1,5 +1,24 @@
 name: ClickUp sync (central)
 
+# Cycle de vie d'une tâche ClickUp liée à une branche / PR :
+#   push / création de branche   -> tâche liée "in progress" (seulement si elle est encore "à faire")
+#   PR ouverte / prête           -> tâche liée "in review"
+#   review demandée              -> une tâche de review par reviewer dans la liste de reviews
+#   changes requested            -> tâche de review réassignée à l'auteur, tâche liée "in progress"
+#   re-demande de review         -> tâche de review rouverte et réassignée au reviewer
+#   approve                      -> tâche de review "complete", tâche liée "approved"
+#   PR mergée                    -> tâche liée "complete", tâches de review restantes "complete"
+# Notifications : chaque étape importante ajoute un commentaire ClickUp avec notify_all
+# (assignés + watchers notifiés dans ClickUp, mail et mobile selon leurs préférences).
+#
+# Lien tâche <-> code : ID "CU-xxxx" dans la branche, le titre ou la description de la PR.
+#
+# Variables d'organisation (Settings > Variables) :
+#   CLICKUP_REVIEW_LIST_ID  (requis)  liste où sont créées les tâches de review
+#   CLICKUP_USERS           (optionnel) {"github-login": clickup_user_id, ...}
+#
+# Statuts ClickUp utilisés (env S_* ci-dessous) : ils doivent exister dans les listes.
+
 on:
   workflow_call:
     secrets:
@@ -10,151 +29,127 @@ permissions:
   contents: read
 
 jobs:
-  create-review-task:
-    if: github.event_name == 'pull_request'
+  sync:
+    if: github.event_name != 'create' || github.event.ref_type == 'branch'
     runs-on: ubuntu-latest
+    concurrency:
+      group: clickup-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
     steps:
-      - name: Créer la tâche de review dans ClickUp
+      - name: Synchroniser ClickUp
         env:
           CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
           LIST_ID: ${{ vars.CLICKUP_REVIEW_LIST_ID }}
-          USERS: ${{ vars.CLICKUP_USERS }}
-          REVIEWER: ${{ github.event.requested_reviewer.login }}
+          USERS: ${{ vars.CLICKUP_USERS || '{}' }}
+          S_IN_PROGRESS: "in progress"
+          S_REVIEW: "in review"
+          S_APPROVED: "approved"
+          S_DONE: "complete"
+          S_REVIEW_TODO: "to do"
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          REPO: ${{ github.repository }}
+          # create -> github.event.ref ; push -> github.ref_name ; PR -> branche source
+          BRANCH: ${{ github.event.pull_request.head.ref || (github.event_name == 'create' && github.event.ref) || github.ref_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [ -z "${REVIEWER}" ]; then
-            echo "Review demandée à une équipe GitHub, pas à une personne : rien à faire."
-            exit 0
-          fi
-          ASSIGNEE=$(echo "$USERS" | jq -r --arg u "$REVIEWER" '.[$u] // empty')
-          if [ -z "$ASSIGNEE" ]; then
-            echo "Pas d'ID ClickUp pour $REVIEWER dans CLICKUP_USERS : tâche créée sans assigné."
-          fi
-          DUE=$(( ($(date +%s) + 2*24*3600) * 1000 ))   # échéance : J+2
-          BODY=$(jq -n \
-            --arg name "Review PR #$PR_NUMBER · $REPO · $PR_TITLE" \
-            --arg desc "$(printf 'Review demandée à **%s** par %s.\n\nPR : %s' "$REVIEWER" "$PR_AUTHOR" "$PR_URL")" \
-            --arg tag "$(echo "pr-$(basename "$REPO")-$PR_NUMBER-$REVIEWER" | tr "[:upper:]" "[:lower:]")" \
-            --argjson due "$DUE" \
-            --arg assignee "$ASSIGNEE" \
-            '{name:$name, markdown_content:$desc, due_date:$due, tags:["review",$tag], priority:2}
-             + (if $assignee != "" then {assignees:[($assignee|tonumber)]} else {} end)')
-          curl -sS --fail -X POST "https://api.clickup.com/api/v2/list/$LIST_ID/task" \
-            -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
-            -d "$BODY" | jq '{id, url}'
-
-  # PR créée (ou rouverte) -> la tâche ClickUp liée passe en "in progress".
-  # Si des reviewers sont déjà demandés à la création, on laisse faire le job
-  # "pr-on-hold" (sinon les deux jobs se disputeraient le statut).
-  pr-opened:
-    if: github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Passer la tâche liée en "in progress"
-        env:
-          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          REVIEWERS: ${{ join(github.event.pull_request.requested_reviewers.*.login, ',') }}
-          TEAMS: ${{ join(github.event.pull_request.requested_teams.*.slug, ',') }}
-        run: |
-          set -euo pipefail
-          if [ -n "$REVIEWERS$TEAMS" ]; then
-            echo "Des reviewers sont déjà demandés : le statut sera géré par le job on-hold."
-            exit 0
-          fi
-          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "$PR_TITLE" "${PR_BODY:-}" \
-            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
-          if [ -z "$TASK_IDS" ]; then
-            echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description : rien à faire."
-          fi
-          for id in $TASK_IDS; do
-            curl -sS --fail -X PUT "https://api.clickup.com/api/v2/task/$id" \
-              -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
-              -d '{"status":"in progress"}' > /dev/null \
-              && echo "Tâche $id passée en in progress" \
-              || echo "Impossible de modifier $id (ID inconnu ?)"
-          done
-
-  # Review demandée à quelqu'un -> la tâche ClickUp liée passe en "on hold"
-  # (elle attend la review). La tâche de review, elle, est créée par le job create-review-task.
-  pr-on-hold:
-    if: github.event_name == 'pull_request' && github.event.action == 'review_requested'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Passer la tâche liée en "on hold"
-        env:
-          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          set -euo pipefail
-          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "$PR_TITLE" "${PR_BODY:-}" \
-            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
-          if [ -z "$TASK_IDS" ]; then
-            echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description : rien à faire."
-          fi
-          for id in $TASK_IDS; do
-            curl -sS --fail -X PUT "https://api.clickup.com/api/v2/task/$id" \
-              -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
-              -d '{"status":"on hold"}' > /dev/null \
-              && echo "Tâche $id passée en on hold" \
-              || echo "Impossible de modifier $id (ID inconnu ?)"
-          done
-
-  close-on-approval:
-    # Le job tourne à chaque review soumise (pour que les logs soient visibles),
-    # mais ne ferme quelque chose que si c'est une validation (Approve).
-    # "Request changes" ou un simple commentaire ne ferme rien.
-    if: github.event_name == 'pull_request_review'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Afficher l'état de la review
-        env:
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          REQUESTED_REVIEWER: ${{ github.event.requested_reviewer.login }}
+          REVIEWER: ${{ github.event.review.user.login }}
           REVIEW_STATE: ${{ github.event.review.state }}
-          REVIEWER: ${{ github.event.review.user.login }}
-        run: |
-          echo "Review de $REVIEWER : état = $REVIEW_STATE"
-          if [ "${REVIEW_STATE,,}" != "approved" ]; then
-            echo "Ce n'est pas une validation (Approve) : aucune tâche ClickUp n'est fermée."
-          fi
-
-      - name: Passer la tâche de review et la tâche liée en "complete"
-        if: github.event.review.state == 'approved'
-        env:
-          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
-          LIST_ID: ${{ vars.CLICKUP_REVIEW_LIST_ID }}
-          REVIEWER: ${{ github.event.review.user.login }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
         run: |
           set -euo pipefail
-          complete() {
-            curl -sS --fail -X PUT "https://api.clickup.com/api/v2/task/$1" \
-              -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" \
-              -d '{"status":"complete"}' > /dev/null && echo "Tâche $1 passée en complete"
+          API=https://api.clickup.com/api/v2
+          cu() { curl -sS --fail -H "Authorization: $CLICKUP_TOKEN" -H "Content-Type: application/json" "$@"; }
+
+          task_url() { echo "$API/task/$1${2:-}"; }
+          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "${PR_TITLE:-}" "${PR_BODY:-}" \
+            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
+          [ -n "$TASK_IDS" ] || echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description."
+
+          # Les échecs sur une tâche (ID inconnu, statut inexistant) sont loggés sans faire échouer le job.
+          set_status() { cu -X PUT "$(task_url "$1")" -d "$(jq -n --arg s "$2" '{status:$s}')" > /dev/null \
+            && echo "Tâche $1 -> $2" || echo "::warning::Impossible de passer $1 en '$2' (ID ou statut inconnu ?)"; }
+          notify() { cu -X POST "$(task_url "$1" /comment)" -d "$(jq -n --arg t "$2" '{comment_text:$t, notify_all:true}')" > /dev/null \
+            || echo "::warning::Impossible de commenter $1"; }
+          linked() { for id in $TASK_IDS; do set_status "$id" "$1"; [ -z "${2:-}" ] || notify "$id" "$2"; done; }
+
+          clickup_user() { echo "$USERS" | jq -r --arg u "$1" '.[$u] // empty'; }
+          slug() { echo "$*" | tr '[:upper:]' '[:lower:]'; }
+          PR_TAG=$(slug "pr-$(basename "$REPO")-${PR_NUMBER:-0}")
+          review_tasks() {  # $1 = tag ; inclut les tâches fermées pour pouvoir les rouvrir
+            cu "$API/list/$LIST_ID/task?include_closed=true&tags%5B%5D=$1" | jq -r '.tasks[].id'
+          }
+          reassign() {  # $1 = tâche, $2 = login à ajouter, $3 = login à retirer
+            local add rem; add=$(clickup_user "$2"); rem=$(clickup_user "$3")
+            cu -X PUT "$API/task/$1" -d "$(jq -n --arg a "$add" --arg r "$rem" \
+              '{assignees:{add:([$a]|map(select(.!="")|tonumber)), rem:([$r]|map(select(.!="")|tonumber))}}')" > /dev/null \
+              && echo "Tâche de review $1 réassignée à $2" || echo "::warning::Impossible de réassigner $1"
           }
 
-          # 1) La tâche de review du reviewer
-          TAG=$(echo "pr-$(basename "$REPO")-$PR_NUMBER-$REVIEWER" | tr "[:upper:]" "[:lower:]")
-          IDS=$(curl -sS --fail "https://api.clickup.com/api/v2/list/$LIST_ID/task?tags%5B%5D=$TAG" \
-            -H "Authorization: $CLICKUP_TOKEN" | jq -r '.tasks[].id')
-          for id in $IDS; do complete "$id"; done
+          case "$EVENT/${ACTION:-}" in
+            create/*|push/*)
+              # Ne fait avancer que les tâches encore "à faire" : un push sur une PR en review ne la fait pas reculer.
+              for id in $TASK_IDS; do
+                TYPE=$(cu "$(task_url "$id")" | jq -r '.status.type') || { echo "::warning::Tâche $id introuvable"; continue; }
+                if [ "$TYPE" = "open" ]; then set_status "$id" "$S_IN_PROGRESS"; else echo "Tâche $id déjà commencée : inchangée."; fi
+              done ;;
 
-          # 2) La tâche de dev liée : ID "CU-xxxx" dans la branche, le titre ou la description de la PR
-          TASK_IDS=$(printf '%s\n%s\n%s' "$BRANCH" "$PR_TITLE" "${PR_BODY:-}" \
-            | grep -oiE 'CU-[a-z0-9]+' | cut -c4- | tr '[:upper:]' '[:lower:]' | sort -u || true)
-          if [ -z "$TASK_IDS" ]; then
-            echo "Aucun ID CU-xxxx trouvé dans la branche / le titre / la description : rien d'autre à fermer."
-          fi
-          for id in $TASK_IDS; do complete "$id" || echo "Impossible de fermer $id (ID inconnu ?)"; done
+            pull_request/opened|pull_request/reopened|pull_request/ready_for_review)
+              if [ "$PR_DRAFT" = "true" ]; then echo "PR en brouillon : pas encore en review."; exit 0; fi
+              linked "$S_REVIEW" "PR #$PR_NUMBER ouverte par $PR_AUTHOR, en attente de review : $PR_URL" ;;
+
+            pull_request/review_requested)
+              if [ -z "$REQUESTED_REVIEWER" ]; then echo "Review demandée à une équipe GitHub : rien à faire."; exit 0; fi
+              TAG=$(slug "$PR_TAG-$REQUESTED_REVIEWER")
+              EXISTING=$(review_tasks "$TAG")
+              if [ -n "$EXISTING" ]; then
+                # Re-demande après "changes requested" : on rouvre et on rend la tâche au reviewer.
+                for id in $EXISTING; do
+                  set_status "$id" "$S_REVIEW_TODO"
+                  reassign "$id" "$REQUESTED_REVIEWER" "$PR_AUTHOR"
+                  notify "$id" "$PR_AUTHOR redemande une review à $REQUESTED_REVIEWER : $PR_URL"
+                done
+              else
+                ASSIGNEE=$(clickup_user "$REQUESTED_REVIEWER")
+                [ -n "$ASSIGNEE" ] || echo "::warning::Pas d'ID ClickUp pour $REQUESTED_REVIEWER dans CLICKUP_USERS : tâche sans assigné."
+                DUE=$(( ($(date +%s) + 2*24*3600) * 1000 ))   # échéance : J+2
+                BODY=$(jq -n \
+                  --arg name "Review PR #$PR_NUMBER · $REPO · $PR_TITLE" \
+                  --arg desc "$(printf 'Review demandée à **%s** par %s.\n\nPR : %s' "$REQUESTED_REVIEWER" "$PR_AUTHOR" "$PR_URL")" \
+                  --arg tag "$TAG" --arg prtag "$PR_TAG" --argjson due "$DUE" --arg assignee "$ASSIGNEE" \
+                  '{name:$name, markdown_content:$desc, due_date:$due, tags:["review",$prtag,$tag], priority:2, notify_all:true}
+                   + (if $assignee != "" then {assignees:[($assignee|tonumber)]} else {} end)')
+                cu -X POST "$API/list/$LIST_ID/task" -d "$BODY" | jq '{id, url}'
+              fi
+              # Une review demandée sur une PR déjà ouverte la (re)met en review.
+              linked "$S_REVIEW" ;;
+
+            pull_request/closed)
+              if [ "$PR_MERGED" != "true" ]; then echo "PR fermée sans merge : rien à faire."; exit 0; fi
+              linked "$S_DONE" "PR #$PR_NUMBER mergée : $PR_URL"
+              for id in $(review_tasks "$PR_TAG"); do set_status "$id" "$S_DONE"; done ;;
+
+            pull_request_review/submitted)
+              TAG=$(slug "$PR_TAG-$REVIEWER")
+              case "${REVIEW_STATE,,}" in
+                approved)
+                  for id in $(review_tasks "$TAG"); do set_status "$id" "$S_DONE"; done
+                  linked "$S_APPROVED" "PR #$PR_NUMBER approuvée par $REVIEWER : $REVIEW_URL" ;;
+                changes_requested)
+                  # La tâche de review passe à l'auteur (c'est à lui d'agir), la tâche liée repart en cours.
+                  for id in $(review_tasks "$TAG"); do
+                    reassign "$id" "$PR_AUTHOR" "$REVIEWER"
+                    notify "$id" "$REVIEWER demande des modifications à $PR_AUTHOR : $REVIEW_URL"
+                  done
+                  linked "$S_IN_PROGRESS" "$REVIEWER demande des modifications sur la PR #$PR_NUMBER : $REVIEW_URL" ;;
+                *) echo "Review de $REVIEWER : état '$REVIEW_STATE', rien à faire." ;;
+              esac ;;
+
+            *) echo "Événement $EVENT/${ACTION:-} non géré." ;;
+          esac
