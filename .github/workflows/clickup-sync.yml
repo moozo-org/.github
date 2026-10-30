@@ -2,8 +2,8 @@ name: ClickUp sync (central)
 
 # Cycle de vie d'une tâche ClickUp liée à une branche / PR :
 #   push / création de branche   -> tâche liée "in progress" (seulement si elle est encore "à faire")
-#   PR ouverte / prête           -> tâche liée "in review"
-#   review demandée              -> une tâche de review par reviewer dans la liste de reviews
+#   PR ouverte / prête           -> tâche liée "in review" + tâche de review (une par PR, sans assigné)
+#   review demandée              -> le reviewer est ajouté à la tâche de review de la PR
 #   changes requested            -> tâche de review réassignée à l'auteur, tâche liée "in progress"
 #   re-demande de review         -> tâche de review rouverte et réassignée au reviewer
 #   approve                      -> tâche de review "complete", tâche liée "approved"
@@ -85,6 +85,19 @@ jobs:
           review_tasks() {  # $1 = tag ; inclut les tâches fermées pour pouvoir les rouvrir
             cu "$API/list/$LIST_ID/task?include_closed=true&tags%5B%5D=$1" | jq -r '.tasks[].id'
           }
+          ensure_review_task() {  # crée la tâche de review de la PR (sans assigné) si elle n'existe pas ; affiche son ID
+            local id; id=$(review_tasks "$PR_TAG" | head -n1)
+            if [ -z "$id" ]; then
+              local due body; due=$(( ($(date +%s) + 2*24*3600) * 1000 ))   # échéance : J+2
+              body=$(jq -n --arg name "Review PR #$PR_NUMBER · $REPO · $PR_TITLE" \
+                --arg desc "$(printf 'Review de la PR de %s.\n\nPR : %s' "$PR_AUTHOR" "$PR_URL")" \
+                --arg prtag "$PR_TAG" --argjson due "$due" \
+                '{name:$name, markdown_content:$desc, due_date:$due, tags:["review",$prtag], priority:2}')
+              id=$(cu -X POST "$API/list/$LIST_ID/task" -d "$body" | jq -r '.id')
+              echo "Tâche de review $id créée" >&2
+            fi
+            echo "$id"
+          }
           reassign() {  # $1 = tâche, $2 = login à ajouter, $3 = login à retirer
             local add rem; add=$(clickup_user "$2"); rem=$(clickup_user "$3")
             cu -X PUT "$API/task/$1" -d "$(jq -n --arg a "$add" --arg r "$rem" \
@@ -102,31 +115,17 @@ jobs:
 
             pull_request/opened|pull_request/reopened|pull_request/ready_for_review)
               if [ "$PR_DRAFT" = "true" ]; then echo "PR en brouillon : pas encore en review."; exit 0; fi
+              ensure_review_task > /dev/null
               linked "$S_REVIEW" "PR #$PR_NUMBER ouverte par $PR_AUTHOR, en attente de review : $PR_URL" ;;
 
             pull_request/review_requested)
               if [ -z "$REQUESTED_REVIEWER" ]; then echo "Review demandée à une équipe GitHub : rien à faire."; exit 0; fi
-              TAG=$(slug "$PR_TAG-$REQUESTED_REVIEWER")
-              EXISTING=$(review_tasks "$TAG")
-              if [ -n "$EXISTING" ]; then
-                # Re-demande après "changes requested" : on rouvre et on rend la tâche au reviewer.
-                for id in $EXISTING; do
-                  set_status "$id" "$S_REVIEW_TODO"
-                  reassign "$id" "$REQUESTED_REVIEWER" "$PR_AUTHOR"
-                  notify "$id" "$PR_AUTHOR redemande une review à $REQUESTED_REVIEWER : $PR_URL"
-                done
-              else
-                ASSIGNEE=$(clickup_user "$REQUESTED_REVIEWER")
-                [ -n "$ASSIGNEE" ] || echo "::warning::Pas d'ID ClickUp pour $REQUESTED_REVIEWER dans CLICKUP_USERS : tâche sans assigné."
-                DUE=$(( ($(date +%s) + 2*24*3600) * 1000 ))   # échéance : J+2
-                BODY=$(jq -n \
-                  --arg name "Review PR #$PR_NUMBER · $REPO · $PR_TITLE" \
-                  --arg desc "$(printf 'Review demandée à **%s** par %s.\n\nPR : %s' "$REQUESTED_REVIEWER" "$PR_AUTHOR" "$PR_URL")" \
-                  --arg tag "$TAG" --arg prtag "$PR_TAG" --argjson due "$DUE" --arg assignee "$ASSIGNEE" \
-                  '{name:$name, markdown_content:$desc, due_date:$due, tags:["review",$prtag,$tag], priority:2, notify_all:true}
-                   + (if $assignee != "" then {assignees:[($assignee|tonumber)]} else {} end)')
-                cu -X POST "$API/list/$LIST_ID/task" -d "$BODY" | jq '{id, url}'
-              fi
+              # Le reviewer est ajouté à la tâche existante ; rouverte si la review est re-demandée.
+              id=$(ensure_review_task)
+              [ -n "$(clickup_user "$REQUESTED_REVIEWER")" ] || echo "::warning::Pas d'ID ClickUp pour $REQUESTED_REVIEWER dans CLICKUP_USERS : tâche sans assigné."
+              set_status "$id" "$S_REVIEW_TODO"
+              reassign "$id" "$REQUESTED_REVIEWER" "$PR_AUTHOR"
+              notify "$id" "$PR_AUTHOR demande une review à $REQUESTED_REVIEWER : $PR_URL"
               # Une review demandée sur une PR déjà ouverte la (re)met en review.
               linked "$S_REVIEW" ;;
 
@@ -136,14 +135,13 @@ jobs:
               for id in $(review_tasks "$PR_TAG"); do set_status "$id" "$S_DONE"; done ;;
 
             pull_request_review/submitted)
-              TAG=$(slug "$PR_TAG-$REVIEWER")
               case "${REVIEW_STATE,,}" in
                 approved)
-                  for id in $(review_tasks "$TAG"); do set_status "$id" "$S_DONE"; done
+                  for id in $(review_tasks "$PR_TAG"); do set_status "$id" "$S_DONE"; done
                   linked "$S_APPROVED" "PR #$PR_NUMBER approuvée par $REVIEWER : $REVIEW_URL" ;;
                 changes_requested)
                   # La tâche de review passe à l'auteur (c'est à lui d'agir), la tâche liée repart en cours.
-                  for id in $(review_tasks "$TAG"); do
+                  for id in $(review_tasks "$PR_TAG"); do
                     reassign "$id" "$PR_AUTHOR" "$REVIEWER"
                     notify "$id" "$REVIEWER demande des modifications à $PR_AUTHOR : $REVIEW_URL"
                   done
