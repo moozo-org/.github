@@ -2,6 +2,7 @@ name: ClickUp sync (central)
 
 # Cycle de vie d'une tâche ClickUp liée à une branche / PR :
 #   push / création de branche   -> tâche liée "in progress" (seulement si elle est encore "à faire")
+#   PR en brouillon              -> tâche liée "in progress"
 #   PR ouverte / prête           -> tâche liée "in review" + tâche de review (une par PR, sans assigné)
 #   review demandée              -> le reviewer est ajouté à la tâche de review de la PR
 #   changes requested            -> tâche de review réassignée à l'auteur, tâche liée "in progress"
@@ -113,8 +114,8 @@ jobs:
                 if [ "$TYPE" = "open" ]; then set_status "$id" "$S_IN_PROGRESS"; else echo "Tâche $id déjà commencée : inchangée."; fi
               done ;;
 
-            pull_request/opened|pull_request/reopened|pull_request/ready_for_review)
-              if [ "$PR_DRAFT" = "true" ]; then echo "PR en brouillon : pas encore en review."; exit 0; fi
+            pull_request/opened|pull_request/reopened|pull_request/ready_for_review|pull_request/converted_to_draft)
+              if [ "$PR_DRAFT" = "true" ]; then linked "$S_IN_PROGRESS" "PR #$PR_NUMBER en brouillon : $PR_URL"; exit 0; fi
               ensure_review_task > /dev/null
               linked "$S_REVIEW" "PR #$PR_NUMBER ouverte par $PR_AUTHOR, en attente de review : $PR_URL" ;;
 
